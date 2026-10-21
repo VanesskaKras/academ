@@ -9,7 +9,9 @@ function ensureAdminApp() {
   if (getApps().length) return;
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
   if (!raw) throw new Error("FIREBASE_SERVICE_ACCOUNT не задано — потрібен JSON-ключ сервісного акаунта Firebase");
-  initializeApp({ credential: cert(JSON.parse(raw)) });
+  // Приймаємо або сирий JSON, або його base64 (стійкіше до пошкодження лапок/переносів у UI)
+  const text = raw.trim().startsWith("{") ? raw : Buffer.from(raw.trim(), "base64").toString("utf8");
+  initializeApp({ credential: cert(JSON.parse(text)) });
 }
 
 export async function requireAuth(req, res) {
