@@ -1,0 +1,20 @@
+{
+    "rewrites": [
+        {
+            "source": "/api/search-core",
+            "destination": "/api/search-lite?kind=core"
+        },
+        {
+            "source": "/api/search-doaj",
+            "destination": "/api/search-lite?kind=doaj"
+        },
+        {
+            "source": "/api/search-books",
+            "destination": "/api/search-lite?kind=books"
+        },
+        {
+            "source": "/api/(.*)",
+            "destination": "/api/$1"
+        }
+    ]
+}
