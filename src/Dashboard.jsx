@@ -31,6 +31,140 @@ function getStatStatus(o) {
     return s;
 }
 
+const RATE_KEY = "finance_usd_uah_rate";
+const money = (n) => (Math.round(n * 100) / 100).toLocaleString("uk-UA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Бічна панель «Фінанси»: замовлення згруповані за номером — кілька генерацій
+// з одним номером (окремі документи orders) складаються в один рядок.
+// Ціна (грн) вводиться вручну й пишеться в поле price усіх документів групи.
+function FinancePanel({ orders, onPriceSaved }) {
+    const [open, setOpen] = useState(false);
+    const [rate, setRate] = useState(() => {
+        try { return parseFloat(localStorage.getItem(RATE_KEY)) || 41; } catch { return 41; }
+    });
+    const [drafts, setDrafts] = useState({});
+    const [expanded, setExpanded] = useState(null);
+
+    const { groups, noNumber } = useMemo(() => {
+        const map = new Map();
+        let noNumber = 0;
+        orders.forEach(o => {
+            if (o.type === "file_corrections" && !o.info?.orderNumber) return;
+            const num = String(o.info?.orderNumber ?? "").trim();
+            if (!num) { if (o.totalCostUsd) noNumber++; return; }
+            if (!map.has(num)) map.set(num, { num, docs: [], costUsd: 0, price: null });
+            const g = map.get(num);
+            g.docs.push(o);
+            g.costUsd += o.totalCostUsd || 0;
+            if (g.price == null && typeof o.price === "number") g.price = o.price;
+        });
+        const groups = [...map.values()].sort((a, b) => {
+            const la = a.docs.reduce((m, d) => (d.createdAt || "") > m ? d.createdAt : m, "");
+            const lb = b.docs.reduce((m, d) => (d.createdAt || "") > m ? d.createdAt : m, "");
+            return lb.localeCompare(la);
+        });
+        return { groups, noNumber };
+    }, [orders]);
+
+    const totals = useMemo(() => groups.reduce((t, g) => {
+        t.price += g.price || 0;
+        t.cost += g.costUsd * rate;
+        return t;
+    }, { price: 0, cost: 0 }), [groups, rate]);
+
+    const changeRate = (v) => {
+        const n = parseFloat(v);
+        setRate(Number.isFinite(n) && n > 0 ? n : 0);
+        if (n > 0) { try { localStorage.setItem(RATE_KEY, String(n)); } catch { /* ignore */ } }
+    };
+
+    const savePrice = async (g) => {
+        const raw = drafts[g.num];
+        if (raw === undefined) return;
+        const n = raw.trim() === "" ? null : parseFloat(raw.replace(",", "."));
+        if (n !== null && !Number.isFinite(n)) return;
+        try {
+            await Promise.all(g.docs.map(d => setDoc(doc(db, "orders", d.id), { price: n }, { merge: true })));
+            onPriceSaved(g.docs.map(d => d.id), n);
+            setDrafts(p => { const c = { ...p }; delete c[g.num]; return c; });
+        } catch (e) {
+            console.error(e);
+            alert("Не вдалося зберегти ціну: " + e.message);
+        }
+    };
+
+    const profitColor = (v) => v >= 0 ? "#1a6a1a" : "#c00";
+
+    return (
+        <>
+            <button onClick={() => setOpen(o => !o)}
+                style={{ position: "fixed", right: open ? "min(380px, 100vw)" : 0, top: 120, zIndex: 900, background: "#1a1a14", color: "#e8ff47", border: "none", borderRadius: "8px 0 0 8px", padding: "12px 8px", cursor: "pointer", fontFamily: "inherit", fontSize: 12, fontWeight: 700, letterSpacing: 2, writingMode: "vertical-rl", transition: "right .2s" }}>
+                {open ? "✕ ЗАКРИТИ" : "💰 ФІНАНСИ"}
+            </button>
+            <div style={{ position: "fixed", top: 0, right: 0, bottom: 0, width: "min(380px, 100vw)", background: "#fff", borderLeft: "1px solid #d4cfc4", boxShadow: "-4px 0 24px rgba(0,0,0,0.12)", zIndex: 899, transform: open ? "none" : "translateX(105%)", transition: "transform .2s", display: "flex", flexDirection: "column", fontFamily: "'Spectral',Georgia,serif" }}>
+                <div style={{ background: "#1a1a14", padding: "14px 18px", color: "#e8ff47", fontFamily: "'Spectral SC',serif", fontSize: 14, letterSpacing: 3 }}>ФІНАНСИ</div>
+
+                <div style={{ padding: "12px 18px", borderBottom: "1px solid #eee", display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#666" }}>
+                    Курс $1 =
+                    <input type="number" min="0" step="0.1" value={rate || ""} onChange={e => changeRate(e.target.value)}
+                        style={{ width: 70, padding: "4px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 13 }} />
+                    грн
+                </div>
+
+                <div style={{ flex: 1, overflowY: "auto", padding: "8px 18px" }}>
+                    {groups.length === 0 && <div style={{ color: "#aaa", fontSize: 13, padding: "20px 0" }}>Немає замовлень з номером.</div>}
+                    {groups.map(g => {
+                        const costUah = g.costUsd * rate;
+                        const profit = g.price != null ? g.price - costUah : null;
+                        const draft = drafts[g.num];
+                        return (
+                            <div key={g.num} style={{ borderBottom: "1px solid #eee", padding: "10px 0" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                                    <div onClick={() => setExpanded(expanded === g.num ? null : g.num)} style={{ cursor: g.docs.length > 1 ? "pointer" : "default", fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#5a1a8a" }}>
+                                        № {g.num}
+                                        {g.docs.length > 1 && <span style={{ marginLeft: 6, background: "#f0e8ff", borderRadius: 8, padding: "1px 7px", fontSize: 11 }}>{g.docs.length} ген. {expanded === g.num ? "▴" : "▾"}</span>}
+                                    </div>
+                                    <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "#666" }}>
+                                        Ціна
+                                        <input type="text" inputMode="decimal" placeholder="грн"
+                                            value={draft ?? (g.price ?? "")}
+                                            onChange={e => setDrafts(p => ({ ...p, [g.num]: e.target.value }))}
+                                            onBlur={() => savePrice(g)}
+                                            onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); }}
+                                            style={{ width: 80, padding: "4px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 13, textAlign: "right" }} />
+                                    </div>
+                                </div>
+                                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 12, color: "#555" }}>
+                                    <span>Витрачено: <b>${g.costUsd.toFixed(2)}</b> ({money(costUah)} грн)</span>
+                                    <span>Прибуток: <b style={{ color: profit == null ? "#aaa" : profitColor(profit) }}>{profit == null ? "—" : `${money(profit)} грн`}</b></span>
+                                </div>
+                                {expanded === g.num && g.docs.length > 1 && (
+                                    <div style={{ marginTop: 6, paddingLeft: 10, borderLeft: "2px solid #e8e0f5", fontSize: 11, color: "#888" }}>
+                                        {g.docs.map(d => (
+                                            <div key={d.id} style={{ display: "flex", justifyContent: "space-between" }}>
+                                                <span>{d.createdAt?.slice(0, 10) || "—"} · {d.type || d.mode || "—"}</span>
+                                                <span>${(d.totalCostUsd || 0).toFixed(2)}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })}
+                    {noNumber > 0 && <div style={{ fontSize: 11, color: "#aaa", padding: "10px 0" }}>Ще {noNumber} замовлень з витратами без номера — не враховано.</div>}
+                </div>
+
+                <div style={{ borderTop: "2px solid #1a1a14", padding: "14px 18px", background: "#f5f2eb", fontSize: 13 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}><span>Загальна ціна</span><b>{money(totals.price)} грн</b></div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}><span>Витрачено</span><b>{money(totals.cost)} грн (${(totals.cost / (rate || 1)).toFixed(2)})</b></div>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 15 }}><span>Чистий прибуток</span><b style={{ color: profitColor(totals.price - totals.cost) }}>{money(totals.price - totals.cost)} грн</b></div>
+                    <div style={{ fontSize: 10, color: "#aaa", marginTop: 6 }}>Витрати — по всіх замовленнях з номером, навіть якщо ціну ще не вказано.</div>
+                </div>
+            </div>
+        </>
+    );
+}
+
 function UserStatsModal({ orders, onClose }) {
     const todayStr = new Date().toISOString().slice(0, 10);
 
@@ -1100,6 +1234,19 @@ export default function Dashboard({ onOpen, onNew, onAdmin, onTraining, onFileCo
                         ))}
                     </div>
                 </div>
+            )}
+
+            {/* Фінанси (бічна панель) */}
+            {!loading && (
+                <FinancePanel
+                    orders={allOrdersFull ?? orders}
+                    onPriceSaved={(ids, price) => {
+                        const set = new Set(ids);
+                        const patch = o => set.has(o.id) ? { ...o, price } : o;
+                        setOrders(p => p.map(patch));
+                        setAllOrdersFull(p => p && p.map(patch));
+                    }}
+                />
             )}
 
             {/* Мої результати */}
