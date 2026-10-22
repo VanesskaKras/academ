@@ -12,7 +12,7 @@ import { callClaude, callGemini, MODEL, MODEL_FAST, resetGenerationCost, getProx
 import { playDoneSound } from "./lib/audio.js";
 import { stripEmDash } from "./lib/wordCount.js";
 import { buildSYS, SYS_JSON, SYS_JSON_SHORT, SYS_JSON_ARRAY, STRUCTURE_READING_PROMPT, buildClientMaterialsAnalysisPrompt, buildExtractStructurePrompt, buildAnnotationRegenPrompt, buildAntiPlagiarismSYS, buildAntiDetectionSYS, buildClientPlanEditsPrompt, getStyleProfileForSection, localPhrasesStep, localPhrasesJsonField, localPhrasesJsonFieldBatch } from "./lib/prompts.js";
-import { FIELD_LABELS, isEcon, isTechnical, getEmpiricalSections, getEconSections, getTechnicalSections, CODE_FILE_EXTENSIONS, STAGES_SOURCES_FIRST, STAGE_KEYS_SOURCES_FIRST, ORDER_STATUS, parsePagesAvg, buildPlanText, buildPreviewStructure, calcSourceDist, buildWorkConfig, getLangLabels, insertBeforeTail, scanFigures, renumberSections, rebuildWithChapterConclusions, applyPlanEditOps, describePlanEditOp, mergeIntroComponents, localSourceLangCode, chapterHeadingPrefix, normLangName } from "./lib/planUtils.js";
+import { FIELD_LABELS, isEcon, getEmpiricalSections, getEconSections, getTechnicalSections, CODE_FILE_EXTENSIONS, STAGES_SOURCES_FIRST, STAGE_KEYS_SOURCES_FIRST, ORDER_STATUS, parsePagesAvg, buildPlanText, buildPreviewStructure, calcSourceDist, buildWorkConfig, getLangLabels, insertBeforeTail, scanFigures, renumberSections, rebuildWithChapterConclusions, applyPlanEditOps, describePlanEditOp, mergeIntroComponents, localSourceLangCode, chapterHeadingPrefix, normLangName } from "./lib/planUtils.js";
 import { serializeForFirestore } from "./lib/firestoreUtils.js";
 import { normalizeWorkType } from "./lib/academicDefaults.js";
 import { searchByPhrase, phraseSearchOpts, filterSourcesWithGemini, getEconInstitutionalSources, generateAlternatePhrases, enrichSources } from "./lib/sourcesSearch.js";
@@ -2377,7 +2377,6 @@ ${secBlock}
     // Для econ-аналітичних підрозділів додаємо офіційну статистику (Держстат/НБУ/Мінфін/World Bank)
     // як нагадування-посилання, поряд зі знайденими науковими статтями
     const isEconSecForSources = isEcon(info) && getEconSections(sections, info).includes(secId);
-    const isTechnicalWork = isTechnical(info);
     const institutionalGroup = (isFirstSearch && isEconSecForSources)
       ? [{ phrase: "Офіційна статистика", papers: getEconInstitutionalSources() }]
       : [];
@@ -2437,7 +2436,9 @@ ${secBlock}
       }
       const processPhrase = async ({ thesis, phrase, pi }) => {
         if (stopSearchRef.current) return;
-        const useScholar = pi === 0 || isTechnicalWork; // Scholar тільки для першої фрази тези; для технічних робіт — на кожній
+        // Scholar — основне джерело україномовних публікацій: на кожній фразі, як у воркері (orderStages.js),
+        // інакше решта фраз давала 1–8 кандидатів і підрозділи лишались із «підтверджено 3 з 5»
+        const useScholar = true;
         const candidates = await searchByPhrase(phrase, 15, page, useScholar, 0, nextEnPhrase(pi), searchOpts(pi));
         if (stopSearchRef.current) return;
         const fresh = candidates.filter(p => {
