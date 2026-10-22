@@ -44,7 +44,8 @@ export default async function handler(req, res) {
     // за 1M). Для частини ключів Google їх закрив («no longer available to new users», 404) — тоді, і лише
     // тоді, йдемо на найдешевшу доступну заміну, а не одразу на 3.5 (lite $0.30/$2.50, flash $1.50/$9.00).
     const MODEL_CHAIN = {
-        "gemini-2.5-flash-lite": ["gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
+        // 2.5-flash-lite закрита для нових ключів (404 на кожному виклику, +1–3 зайві запити) — одразу 3.1
+        "gemini-2.5-flash-lite": ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
         "gemini-2.5-flash":      ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.5-flash"],
         "gemini-2.5-pro":        ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.8-flash"],
     };
