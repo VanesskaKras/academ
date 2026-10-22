@@ -1,0 +1,38 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Профілі: свій — читати/створювати (лише role "user") і оновлювати
+    // без зміни role/approved/blocked; адмін може все.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'user';
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+            && !request.resource.data.diff(resource.data).affectedKeys()
+                 .hasAny(['role', 'approved', 'blocked']));
+      allow delete: if isAdmin();
+    }
+
+    // Список користувачів потрібен адмін-панелі
+    match /users/{uid} {
+      allow list: if isAdmin();
+    }
+
+    // Усе інше (замовлення, навчання, логи) — лише для залогінених
+    match /orders/{id} { allow read, write: if signedIn(); }
+    match /orders/{id}/{sub=**} { allow read, write: if signedIn(); }
+    match /training_sections/{id} { allow read, write: if signedIn(); }
+    match /training_tests/{id} { allow read, write: if signedIn(); }
+    match /training_results/{id} { allow read, write: if signedIn(); }
+    match /finance_topups/{id} { allow read, write: if signedIn(); }
+    match /loginLogs/{id} { allow create: if signedIn(); allow read: if isAdmin(); }
+  }
+}

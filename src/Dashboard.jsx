@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { db } from "./firebase";
-import { collection, query, where, orderBy, limit, startAfter, getDocs, deleteDoc, doc, setDoc } from "firebase/firestore";
+import { collection, query, where, orderBy, limit, startAfter, getDocs, deleteDoc, doc, setDoc, addDoc } from "firebase/firestore";
 import { useAuth } from "./AuthContext";
 
 const STAT_META = [
@@ -32,18 +32,88 @@ function getStatStatus(o) {
 }
 
 const RATE_KEY = "finance_usd_uah_rate";
+const RATE_CACHE_KEY = "finance_usd_uah_rate_cache";
 const money = (n) => (Math.round(n * 100) / 100).toLocaleString("uk-UA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 // Бічна панель «Фінанси»: замовлення згруповані за номером — кілька генерацій
 // з одним номером (окремі документи orders) складаються в один рядок.
 // Ціна (грн) вводиться вручну й пишеться в поле price усіх документів групи.
-function FinancePanel({ orders, onPriceSaved }) {
+function FinancePanel({ orders, onFieldsSaved }) {
     const [open, setOpen] = useState(false);
     const [rate, setRate] = useState(() => {
         try { return parseFloat(localStorage.getItem(RATE_KEY)) || 41; } catch { return 41; }
     });
     const [drafts, setDrafts] = useState({});
     const [expanded, setExpanded] = useState(null);
+    const [rateSrc, setRateSrc] = useState("");
+
+    // Курс USD→UAH з публічного API Монобанку (ліміт — 1 запит / 5 хв, тому кеш 10 хв)
+    const loadRate = async (force) => {
+        try {
+            const cached = JSON.parse(localStorage.getItem(RATE_CACHE_KEY) || "null");
+            if (!force && cached && Date.now() - cached.at < 10 * 60 * 1000) {
+                setRate(cached.rate); setRateSrc("Монобанк"); return;
+            }
+        } catch { /* ignore */ }
+        try {
+            const res = await fetch("https://api.monobank.ua/bank/currency");
+            if (!res.ok) throw new Error(res.status);
+            const list = await res.json();
+            const usd = list.find(c => c.currencyCodeA === 840 && c.currencyCodeB === 980);
+            const r = usd?.rateSell || usd?.rateCross;
+            if (!r) throw new Error("no rate");
+            setRate(r); setRateSrc("Монобанк");
+            try {
+                localStorage.setItem(RATE_CACHE_KEY, JSON.stringify({ rate: r, at: Date.now() }));
+                localStorage.setItem(RATE_KEY, String(r));
+            } catch { /* ignore */ }
+        } catch {
+            setRateSrc("не вдалося оновити, останній збережений");
+        }
+    };
+    useEffect(() => { loadRate(false); }, []);
+
+    // Поповнення балансу Claude / Gemini: скільки $ отримала і скільки грн заплатила.
+    // Реальний курс = усього сплачено грн / усього отримано $ (середньозважений).
+    const [topups, setTopups] = useState([]);
+    const [tpForm, setTpForm] = useState({ provider: "Claude", usd: "", uah: "", date: new Date().toLocaleDateString("sv-SE") });
+    const [showTopups, setShowTopups] = useState(false);
+    useEffect(() => {
+        getDocs(collection(db, "finance_topups"))
+            .then(snap => setTopups(snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.date || "").localeCompare(a.date || ""))))
+            .catch(e => console.error("finance_topups:", e));
+    }, []);
+
+    const tpTotals = useMemo(() => topups.reduce((t, x) => {
+        t.usd += x.usd || 0; t.uah += x.uah || 0;
+        t.byProvider[x.provider] = (t.byProvider[x.provider] || 0) + (x.usd || 0);
+        return t;
+    }, { usd: 0, uah: 0, byProvider: {} }), [topups]);
+    const topupRate = tpTotals.usd > 0 ? tpTotals.uah / tpTotals.usd : null;
+    const effRate = topupRate ?? rate;
+    const spentUsdAll = useMemo(() => orders.reduce((s, o) => s + (o.totalCostUsd || 0), 0), [orders]);
+
+    const addTopup = async () => {
+        const usd = parseFloat(String(tpForm.usd).replace(",", "."));
+        const uah = parseFloat(String(tpForm.uah).replace(",", "."));
+        if (!(usd > 0) || !(uah > 0)) { alert("Вкажи суми в $ і в грн (більше нуля)."); return; }
+        try {
+            const data = { provider: tpForm.provider, usd, uah, date: tpForm.date, createdAt: new Date().toISOString() };
+            const ref = await addDoc(collection(db, "finance_topups"), data);
+            setTopups(p => [{ id: ref.id, ...data }, ...p].sort((a, b) => (b.date || "").localeCompare(a.date || "")));
+            setTpForm(f => ({ ...f, usd: "", uah: "" }));
+        } catch (e) {
+            console.error(e);
+            alert("Не вдалося зберегти поповнення: " + e.message);
+        }
+    };
+    const removeTopup = async (id) => {
+        if (!window.confirm("Видалити це поповнення?")) return;
+        try {
+            await deleteDoc(doc(db, "finance_topups", id));
+            setTopups(p => p.filter(x => x.id !== id));
+        } catch (e) { alert("Не вдалося видалити: " + e.message); }
+    };
 
     const { groups, noNumber } = useMemo(() => {
         const map = new Map();
@@ -57,6 +127,7 @@ function FinancePanel({ orders, onPriceSaved }) {
             g.docs.push(o);
             g.costUsd += o.totalCostUsd || 0;
             if (g.price == null && typeof o.price === "number") g.price = o.price;
+            if (!g.paidAt && o.paidAt) g.paidAt = o.paidAt;
         });
         const groups = [...map.values()].sort((a, b) => {
             const la = a.docs.reduce((m, d) => (d.createdAt || "") > m ? d.createdAt : m, "");
@@ -68,15 +139,32 @@ function FinancePanel({ orders, onPriceSaved }) {
 
     const totals = useMemo(() => groups.reduce((t, g) => {
         t.price += g.price || 0;
-        t.cost += g.costUsd * rate;
+        t.cost += g.costUsd * effRate;
+        if (g.paidAt) t.paid += g.price || 0;
         return t;
-    }, { price: 0, cost: 0 }), [groups, rate]);
+    }, { price: 0, cost: 0, paid: 0 }), [groups, effRate]);
 
     const changeRate = (v) => {
         const n = parseFloat(v);
         setRate(Number.isFinite(n) && n > 0 ? n : 0);
+        setRateSrc("вручну");
         if (n > 0) { try { localStorage.setItem(RATE_KEY, String(n)); } catch { /* ignore */ } }
     };
+
+    // Пише поля (price / paidAt) у всі документи групи з одним номером
+    const saveFields = async (g, patch) => {
+        try {
+            await Promise.all(g.docs.map(d => setDoc(doc(db, "orders", d.id), patch, { merge: true })));
+            onFieldsSaved(g.docs.map(d => d.id), patch);
+            return true;
+        } catch (e) {
+            console.error(e);
+            alert("Не вдалося зберегти: " + e.message);
+            return false;
+        }
+    };
+
+    const togglePaid = (g, paid) => saveFields(g, { paidAt: paid ? new Date().toLocaleDateString("sv-SE") : null });
 
     const savePrice = async (g) => {
         const raw = drafts[g.num];
@@ -84,12 +172,9 @@ function FinancePanel({ orders, onPriceSaved }) {
         const n = raw.trim() === "" ? null : parseFloat(raw.replace(",", "."));
         if (n !== null && !Number.isFinite(n)) return;
         try {
-            await Promise.all(g.docs.map(d => setDoc(doc(db, "orders", d.id), { price: n }, { merge: true })));
-            onPriceSaved(g.docs.map(d => d.id), n);
-            setDrafts(p => { const c = { ...p }; delete c[g.num]; return c; });
+            if (await saveFields(g, { price: n })) setDrafts(p => { const c = { ...p }; delete c[g.num]; return c; });
         } catch (e) {
             console.error(e);
-            alert("Не вдалося зберегти ціну: " + e.message);
         }
     };
 
@@ -104,17 +189,65 @@ function FinancePanel({ orders, onPriceSaved }) {
             <div style={{ position: "fixed", top: 0, right: 0, bottom: 0, width: "min(380px, 100vw)", background: "#fff", borderLeft: "1px solid #d4cfc4", boxShadow: "-4px 0 24px rgba(0,0,0,0.12)", zIndex: 899, transform: open ? "none" : "translateX(105%)", transition: "transform .2s", display: "flex", flexDirection: "column", fontFamily: "'Spectral',Georgia,serif" }}>
                 <div style={{ background: "#1a1a14", padding: "14px 18px", color: "#e8ff47", fontFamily: "'Spectral SC',serif", fontSize: 14, letterSpacing: 3 }}>ФІНАНСИ</div>
 
-                <div style={{ padding: "12px 18px", borderBottom: "1px solid #eee", display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#666" }}>
-                    Курс $1 =
-                    <input type="number" min="0" step="0.1" value={rate || ""} onChange={e => changeRate(e.target.value)}
-                        style={{ width: 70, padding: "4px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 13 }} />
-                    грн
+                <div style={{ padding: "12px 18px", borderBottom: "1px solid #eee", fontSize: 12, color: "#666" }}>
+                    {topupRate ? (
+                        <div>Курс за твоїми поповненнями: <b>{topupRate.toFixed(2)} грн</b> за $1</div>
+                    ) : (
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            Курс $1 =
+                            <input type="number" min="0" step="0.1" value={rate || ""} onChange={e => changeRate(e.target.value)}
+                                style={{ width: 70, padding: "4px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 13 }} />
+                            грн
+                            <button onClick={() => loadRate(true)} title="Оновити курс з Монобанку"
+                                style={{ border: "1.5px solid #d4cfc4", background: "#fff", borderRadius: 6, padding: "3px 8px", cursor: "pointer", fontSize: 12 }}>↻</button>
+                            {rateSrc && <span style={{ fontSize: 10, color: "#aaa" }}>{rateSrc}</span>}
+                        </div>
+                    )}
+                    {tpTotals.usd > 0 && (
+                        <div style={{ marginTop: 6 }}>
+                            Поповнено: <b>${tpTotals.usd.toFixed(2)}</b> за {money(tpTotals.uah)} грн · витрачено ${spentUsdAll.toFixed(2)} ·{" "}
+                            <b style={{ color: tpTotals.usd - spentUsdAll >= 0 ? "#1a6a1a" : "#c00" }}>залишок ${(tpTotals.usd - spentUsdAll).toFixed(2)}</b>
+                            <div style={{ fontSize: 10, color: "#aaa" }}>
+                                {Object.entries(tpTotals.byProvider).map(([k, v]) => `${k}: $${v.toFixed(2)}`).join(" · ")}. Витрати не розбиті по сервісах, тому залишок — загальний.
+                            </div>
+                        </div>
+                    )}
+                    <div style={{ marginTop: 8 }}>
+                        <button onClick={() => setShowTopups(s => !s)}
+                            style={{ border: "1.5px solid #1a1a14", background: "#fff", borderRadius: 6, padding: "4px 10px", cursor: "pointer", fontFamily: "inherit", fontSize: 12, fontWeight: 600 }}>
+                            {showTopups ? "▴ Поповнення" : "▾ Поповнення (Claude / Gemini)"}
+                        </button>
+                    </div>
+                    {showTopups && (
+                        <div style={{ marginTop: 8 }}>
+                            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                                <select value={tpForm.provider} onChange={e => setTpForm(f => ({ ...f, provider: e.target.value }))}
+                                    style={{ padding: "4px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 12 }}>
+                                    <option>Claude</option><option>Gemini</option>
+                                </select>
+                                <input type="text" inputMode="decimal" placeholder="$" value={tpForm.usd} onChange={e => setTpForm(f => ({ ...f, usd: e.target.value }))}
+                                    style={{ width: 60, padding: "4px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 12 }} />
+                                <input type="text" inputMode="decimal" placeholder="грн" value={tpForm.uah} onChange={e => setTpForm(f => ({ ...f, uah: e.target.value }))}
+                                    style={{ width: 70, padding: "4px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 12 }} />
+                                <input type="date" value={tpForm.date} onChange={e => e.target.value && setTpForm(f => ({ ...f, date: e.target.value }))}
+                                    style={{ padding: "3px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 12 }} />
+                                <button onClick={addTopup}
+                                    style={{ background: "#1a1a14", color: "#e8ff47", border: "none", borderRadius: 6, padding: "5px 12px", cursor: "pointer", fontFamily: "inherit", fontSize: 12, fontWeight: 700 }}>+ Додати</button>
+                            </div>
+                            {topups.map(x => (
+                                <div key={x.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6, fontSize: 11, color: "#666" }}>
+                                    <span>{x.date} · {x.provider} · ${x.usd} за {money(x.uah)} грн ({(x.uah / x.usd).toFixed(2)})</span>
+                                    <button onClick={() => removeTopup(x.id)} style={{ border: "none", background: "none", color: "#c00", cursor: "pointer", fontSize: 13 }}>✕</button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
 
                 <div style={{ flex: 1, overflowY: "auto", padding: "8px 18px" }}>
                     {groups.length === 0 && <div style={{ color: "#aaa", fontSize: 13, padding: "20px 0" }}>Немає замовлень з номером.</div>}
                     {groups.map(g => {
-                        const costUah = g.costUsd * rate;
+                        const costUah = g.costUsd * effRate;
                         const profit = g.price != null ? g.price - costUah : null;
                         const draft = drafts[g.num];
                         return (
@@ -138,6 +271,17 @@ function FinancePanel({ orders, onPriceSaved }) {
                                     <span>Витрачено: <b>${g.costUsd.toFixed(2)}</b> ({money(costUah)} грн)</span>
                                     <span>Прибуток: <b style={{ color: profit == null ? "#aaa" : profitColor(profit) }}>{profit == null ? "—" : `${money(profit)} грн`}</b></span>
                                 </div>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, fontSize: 12, color: "#555" }}>
+                                    <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}>
+                                        <input type="checkbox" checked={!!g.paidAt} onChange={e => togglePaid(g, e.target.checked)} />
+                                        Гроші отримано
+                                    </label>
+                                    {g.paidAt && (
+                                        <input type="date" value={g.paidAt} max="9999-12-31"
+                                            onChange={e => e.target.value && saveFields(g, { paidAt: e.target.value })}
+                                            style={{ padding: "2px 6px", border: "1.5px solid #d4cfc4", borderRadius: 6, fontFamily: "inherit", fontSize: 12 }} />
+                                    )}
+                                </div>
                                 {expanded === g.num && g.docs.length > 1 && (
                                     <div style={{ marginTop: 6, paddingLeft: 10, borderLeft: "2px solid #e8e0f5", fontSize: 11, color: "#888" }}>
                                         {g.docs.map(d => (
@@ -156,7 +300,8 @@ function FinancePanel({ orders, onPriceSaved }) {
 
                 <div style={{ borderTop: "2px solid #1a1a14", padding: "14px 18px", background: "#f5f2eb", fontSize: 13 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}><span>Загальна ціна</span><b>{money(totals.price)} грн</b></div>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}><span>Витрачено</span><b>{money(totals.cost)} грн (${(totals.cost / (rate || 1)).toFixed(2)})</b></div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}><span>Отримано / очікується</span><b>{money(totals.paid)} / {money(totals.price - totals.paid)} грн</b></div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}><span>Витрачено</span><b>{money(totals.cost)} грн (${(totals.cost / (effRate || 1)).toFixed(2)})</b></div>
                     <div style={{ display: "flex", justifyContent: "space-between", fontSize: 15 }}><span>Чистий прибуток</span><b style={{ color: profitColor(totals.price - totals.cost) }}>{money(totals.price - totals.cost)} грн</b></div>
                     <div style={{ fontSize: 10, color: "#aaa", marginTop: 6 }}>Витрати — по всіх замовленнях з номером, навіть якщо ціну ще не вказано.</div>
                 </div>
@@ -1240,9 +1385,9 @@ export default function Dashboard({ onOpen, onNew, onAdmin, onTraining, onFileCo
             {!loading && (
                 <FinancePanel
                     orders={allOrdersFull ?? orders}
-                    onPriceSaved={(ids, price) => {
+                    onFieldsSaved={(ids, fields) => {
                         const set = new Set(ids);
-                        const patch = o => set.has(o.id) ? { ...o, price } : o;
+                        const patch = o => set.has(o.id) ? { ...o, ...fields } : o;
                         setOrders(p => p.map(patch));
                         setAllOrdersFull(p => p && p.map(patch));
                     }}
